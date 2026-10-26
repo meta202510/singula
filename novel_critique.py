@@ -190,7 +190,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=180, help="各API通信のタイムアウト秒")
     parser.add_argument("--min-chars", type=int, help="入力文字数の下限（省略時は制限なし）")
     parser.add_argument("--max-chars", type=int, help="入力文字数の上限（省略時は制限なし）")
+    parser.add_argument("--mock", action="store_true", help="通信・課金なしのモックテスト")
+    parser.add_argument("--mock-stop-after", type=int, help="モックで指定回完了後に停止（1～6）")
+    parser.add_argument("--mock-fail-at", type=int, help="モックで指定回にエラー（1～6）")
+    parser.add_argument("--mock-resume", action="store_true", help="保存済みのモック途中データから再開")
     args = parser.parse_args(argv)
+    if not args.mock and (args.mock_stop_after is not None or args.mock_fail_at is not None or args.mock_resume):
+        parser.error("--mock-* は --mock と同時に指定してください。")
+    if args.mock:
+        from mock_review import MARKER, MockOptions, MockStopped, evaluate_mock
+        mock_options = MockOptions(args.mock_resume, args.mock_stop_after, args.mock_fail_at)
+        try:
+            mock_options.validate()
+        except CritiqueError as exc:
+            parser.error(str(exc))
     if not 256 <= args.max_output_tokens <= 32000:
         parser.error("--max-output-tokens は256～32000にしてください。")
     if not 0 < args.timeout <= 3600:
@@ -201,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_thresholds(args.min_chars, args.max_chars)
     except CritiqueError as exc:
         parser.error(str(exc))
-    output = args.output or args.input.with_name(args.input.stem + "_批評.txt")
+    output = args.output or args.input.with_name(args.input.stem + ("_MOCK_批評.txt" if args.mock else "_批評.txt"))
     try:
         if args.input.resolve() == output.resolve():
             raise CritiqueError("入力ファイルと異なる保存先を指定してください。")
@@ -212,17 +225,27 @@ def main(argv: list[str] | None = None) -> int:
         novel = args.input.read_text(encoding=args.encoding)
         skipped = threshold_result(args.input.name, novel, args.min_chars, args.max_chars)
         if skipped is not None:
+            if args.mock:
+                skipped += MARKER + "\n"
             save_result(output, skipped)
             print(f"評価無し（{len(novel)}文字）。保存しました: {output}")
             return 0
         if not novel.strip():
             raise CritiqueError("入力ファイルが空です。")
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise CritiqueError("環境変数 OPENAI_API_KEY を設定してください。キーをソースに記入しないでください。")
-        reviewer = OpenAIReviewer(api_key, args.model.strip(), args.max_output_tokens, args.timeout)
-        print("小説本文をOpenAI APIへ送信します（合計6回・従量課金）。", file=sys.stderr)
-        reviews, overall = evaluate(novel, reviewer.review, lambda text: print(text, file=sys.stderr))
+        if args.mock:
+            print("[モック] 通信・API課金は発生しません。", file=sys.stderr)
+            try:
+                reviews, overall = evaluate_mock(novel, args.input.name, output, mock_options, lambda text: print(text, file=sys.stderr))
+            except MockStopped as exc:
+                print(str(exc), file=sys.stderr)
+                return 3
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                raise CritiqueError("環境変数 OPENAI_API_KEY を設定してください。キーをソースに記入しないでください。")
+            reviewer = OpenAIReviewer(api_key, args.model.strip(), args.max_output_tokens, args.timeout)
+            print("小説本文をOpenAI APIへ送信します（合計6回・従量課金）。", file=sys.stderr)
+            reviews, overall = evaluate(novel, reviewer.review, lambda text: print(text, file=sys.stderr))
         save_result(output, format_result(args.input.name, reviews, overall))
     except UnicodeError:
         print("入力の文字コードを読み取れません。--encoding を確認してください。", file=sys.stderr)
@@ -230,14 +253,16 @@ def main(argv: list[str] | None = None) -> int:
     except (CritiqueError, OSError) as exc:
         # OSError here is a local file operation error; network errors are sanitized above.
         print(f"処理を完了できませんでした: {exc}", file=sys.stderr)
-        print("送信済みの処理には料金が発生する場合があります。", file=sys.stderr)
+        print("[モック] 通信・課金はありません。" if args.mock else "送信済みの処理には料金が発生する場合があります。", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("中断しました。送信済みの処理には料金が発生する場合があります。", file=sys.stderr)
+        print("[モック] 中断しました。通信・課金はありません。" if args.mock else "中断しました。送信済みの処理には料金が発生する場合があります。", file=sys.stderr)
         return 130
     print(f"保存しました: {output}")
     return 0
 
 
 if __name__ == "__main__":
+    # Mock helpers must share these exception types when launched as a script.
+    sys.modules.setdefault("novel_critique", sys.modules[__name__])
     raise SystemExit(main())
