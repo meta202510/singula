@@ -9,17 +9,14 @@ from queue import Empty, Queue
 import threading
 
 from novel_critique import (
-    DEFAULT_MODEL, CritiqueError, OpenAIReviewer, evaluate, format_result, save_result,
+    DEFAULT_MODEL, MODEL_FETCH_ERROR, CritiqueError, OpenAIReviewer, evaluate, fetch_models, format_result, save_result,
     threshold_result, validate_thresholds,
 )
 from mock_review import MARKER, MockOptions, MockStopped, evaluate_mock
 
-# Local suggestions only: opening the selector never makes an API request.
-MODEL_CHOICES = (
-    DEFAULT_MODEL, "gpt-4.1", "gpt-4.1-nano",
-    "gpt-5", "gpt-5-mini", "gpt-5-nano",
-)
 
+def model_loaded_message(models) -> str:
+    return f"モデルを{len(models)}件取得しました。"
 
 @dataclass(frozen=True)
 class Settings:
@@ -52,8 +49,8 @@ def run_job(settings: Settings, events: Queue) -> None:
             raise CritiqueError("保存先が既に存在します。別の名前を選択してください。")
         if not settings.output_path.parent.is_dir():
             raise CritiqueError("保存先のフォルダーが存在しません。")
-        if not settings.model.strip():
-            raise CritiqueError("モデル名を入力してください。")
+        if not settings.mock and (not settings.model.strip() or settings.model == MODEL_FETCH_ERROR):
+            raise CritiqueError(MODEL_FETCH_ERROR)
         if settings.encoding not in ("utf-8-sig", "cp932", "shift_jis"):
             raise CritiqueError("入力文字コードを選択してください。")
         if not 256 <= settings.max_output_tokens <= 32000 or not 0 < settings.timeout <= 3600:
@@ -101,6 +98,7 @@ def main() -> None:
         def __init__(self, root):
             self.root = root
             self.running = False
+            self.fetching_models = False
             self.events = Queue()
             self.controls = []
             self.completed = 0
@@ -132,7 +130,7 @@ def main() -> None:
             self.input_path = tk.StringVar()
             self.output_path = tk.StringVar()
             self.api_key = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
-            self.model = tk.StringVar(value=DEFAULT_MODEL)
+            self.model = tk.StringVar()
             self.encoding = tk.StringVar(value="utf-8-sig")
             self.tokens = tk.StringVar(value="4000")
             self.timeout = tk.StringVar(value="180")
@@ -146,12 +144,16 @@ def main() -> None:
             self.status = tk.StringVar(value="入力ファイルと保存先を選択してください。")
             self.entry(frame, 2, "小説ファイル", self.input_path, self.select_input)
             self.entry(frame, 3, "結果の保存先", self.output_path, self.select_output)
-            self.entry(frame, 4, "APIキー", self.api_key, password=True)
+            self.api_key_entry = self.entry(frame, 4, "APIキー", self.api_key, password=True)
+            self.api_key_entry.bind("<Return>", lambda _: self.refresh_models())
+            self.api_key_entry.bind("<FocusOut>", lambda _: self.refresh_models())
             ttk.Label(frame, text="キーはこの画面でのみ保持し、設定ファイルには保存しません。").grid(row=5, column=1, columnspan=2, sticky="w")
-            ttk.Label(frame, text="AIモデル（直接入力も可）").grid(row=6, column=0, sticky="w", padx=(0, 12), pady=5)
-            model_selector = ttk.Combobox(frame, textvariable=self.model, values=MODEL_CHOICES, state="normal")
-            model_selector.grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
-            self.controls.append((model_selector, "normal"))
+            ttk.Label(frame, text="AIモデル").grid(row=6, column=0, sticky="w", padx=(0, 12), pady=5)
+            self.model_selector = ttk.Combobox(frame, textvariable=self.model, values=(), state="readonly")
+            self.model_selector.grid(row=6, column=1, sticky="ew", pady=5)
+            self.model_button = ttk.Button(frame, text="モデル一覧を取得", command=self.refresh_models)
+            self.model_button.grid(row=6, column=2, padx=(8, 0), pady=5)
+            self.controls.extend([(self.model_selector, "readonly"), (self.model_button, "normal")])
             ttk.Label(frame, text="入力文字コード").grid(row=7, column=0, sticky="w", padx=(0, 12), pady=5)
             encoding = ttk.Combobox(frame, textvariable=self.encoding, values=("utf-8-sig", "cp932", "shift_jis"), state="readonly")
             encoding.grid(row=7, column=1, columnspan=2, sticky="ew", pady=5)
@@ -183,6 +185,30 @@ def main() -> None:
             self.preview = ScrolledText(frame, wrap="word", height=6, state="disabled")
             self.preview.grid(row=16, column=0, columnspan=3, sticky="nsew")
             root.after(100, self.poll)
+            root.after(200, self.refresh_models)
+
+        def refresh_models(self):
+            if self.fetching_models or self.running:
+                return
+            api_key = self.api_key.get().strip()
+            if not api_key:
+                self.apply_model_error()
+                return
+            self.fetching_models = True
+            self.model_button.configure(state="disabled")
+            self.status.set("利用可能なモデルを取得中です…")
+            threading.Thread(target=self.model_worker, args=(api_key,), daemon=True).start()
+
+        def model_worker(self, api_key):
+            try:
+                self.events.put(("models_loaded", fetch_models(api_key)))
+            except CritiqueError:
+                self.events.put(("models_error", MODEL_FETCH_ERROR))
+
+        def apply_model_error(self):
+            self.model_selector.configure(values=(MODEL_FETCH_ERROR,))
+            self.model.set(MODEL_FETCH_ERROR)
+            self.status.set(MODEL_FETCH_ERROR)
 
         def resize_content(self, event=None):
             self.canvas.itemconfigure(
@@ -221,6 +247,7 @@ def main() -> None:
                 button = ttk.Button(frame, text="参照…", command=browse)
                 button.grid(row=row, column=2, padx=(8, 0), pady=5)
                 self.controls.append((button, "normal"))
+            return widget
 
         def select_input(self):
             path = filedialog.askopenfilename(parent=self.root, title="小説を選択", filetypes=[("テキスト", "*.txt"), ("すべて", "*")])
@@ -263,7 +290,11 @@ def main() -> None:
                 validate_thresholds(min_chars, max_chars)
                 if not 256 <= tokens <= 32000 or not 1 <= timeout <= 3600:
                     raise ValueError("出力トークンは256～32000、タイムアウトは1～3600秒にしてください。")
-                settings = Settings(Path(self.input_path.get()), Path(self.output_path.get()), self.api_key.get(), self.model.get(), self.encoding.get(), tokens, timeout, min_chars, max_chars)
+                selected_model = self.model.get().strip()
+                if not self.mock.get() and (not selected_model or selected_model == MODEL_FETCH_ERROR):
+                    raise CritiqueError(MODEL_FETCH_ERROR)
+                model_for_run = selected_model if selected_model and selected_model != MODEL_FETCH_ERROR else "API未使用"
+                settings = Settings(Path(self.input_path.get()), Path(self.output_path.get()), self.api_key.get(), model_for_run, self.encoding.get(), tokens, timeout, min_chars, max_chars)
                 settings = replace(settings, mock=self.mock.get(), mock_resume=self.mock_resume.get(), mock_stop_after=int(self.mock_stop.get()) if self.mock_stop.get() else None, mock_fail_at=int(self.mock_fail.get()) if self.mock_fail.get() else None)
             except (ValueError, CritiqueError) as exc:
                 messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
@@ -287,7 +318,17 @@ def main() -> None:
             try:
                 while True:
                     kind, text = self.events.get_nowait()
-                    if kind == "progress":
+                    if kind == "models_loaded":
+                        self.fetching_models = False
+                        self.model_button.configure(state="normal")
+                        self.model_selector.configure(values=text)
+                        self.model.set(text[0])
+                        self.status.set(model_loaded_message(text))
+                    elif kind == "models_error":
+                        self.fetching_models = False
+                        self.model_button.configure(state="normal")
+                        self.apply_model_error()
+                    elif kind == "progress":
                         self.progress["value"] = self.completed
                         self.completed += 1
                         self.status.set(text)
@@ -317,6 +358,14 @@ def main() -> None:
             self.root.destroy()
 
     root = tk.Tk()
+    def report_callback_exception(_error_type, _error, _traceback):
+        messagebox.showerror(
+            "画面処理エラー",
+            "画面処理中に予期しないエラーが発生しました。\n"
+            "詳細確認が必要な場合は start_gui.bat から起動してください。",
+            parent=root,
+        )
+    root.report_callback_exception = report_callback_exception
     Application(root)
     root.mainloop()
 

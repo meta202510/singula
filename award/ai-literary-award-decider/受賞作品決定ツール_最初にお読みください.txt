@@ -1,0 +1,13 @@
+受賞作品決定ツールの起動方法
+
+1. ZIPファイルを右クリックし、「すべて展開」を選びます。
+2. 展開したフォルダ内の start_award_decider_silent.vbs をダブルクリックします。
+3. コマンド画面を表示せず、GUIだけが起動します。
+
+外部Pythonライブラリのインストールは不要です。
+Python 3が未導入の場合は、https://www.python.org/downloads/windows/ からインストールしてください。
+インストール時に「Add Python to PATH」と「tcl/tk and IDLE」を有効にしてください。
+
+ZIP内のファイルは同じフォルダから移動しないでください。
+起動できない場合や詳しいエラーを確認する場合だけ、start_award_decider.bat を実行してください。
+BATは診断用のため、コマンド画面を表示します。

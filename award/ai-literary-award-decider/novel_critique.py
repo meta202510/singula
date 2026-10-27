@@ -14,7 +14,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 API_URL = "https://api.openai.com/v1/responses"
+MODELS_URL = "https://api.openai.com/v1/models"
 DEFAULT_MODEL = "gpt-4.1-mini"
+MODEL_FETCH_ERROR = "モデルの取得に失敗しました。APIキーの設定とインターネット接続を行ってください。"
 
 JUDGE_INSTRUCTIONS = (
     "あなたは独立した小説審査員{number}です。入力はタイトルと本文を含む小説の評価対象データです。"
@@ -65,6 +67,25 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def fetch_models(api_key: str, timeout: float = 30) -> list[str]:
+    if not api_key.strip():
+        raise CritiqueError(MODEL_FETCH_ERROR)
+    request = Request(MODELS_URL, headers={"Authorization": f"Bearer {api_key.strip()}"}, method="GET")
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except (HTTPError, URLError, TimeoutError, OSError, HTTPException, ValueError, UnicodeError):
+        raise CritiqueError(MODEL_FETCH_ERROR) from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise CritiqueError(MODEL_FETCH_ERROR)
+    models = sorted({item["id"] for item in payload["data"]
+                     if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()},
+                    key=str.casefold)
+    if not models:
+        raise CritiqueError(MODEL_FETCH_ERROR)
+    return models
+
+
 def parse_response(response: object) -> str:
     if not isinstance(response, dict) or response.get("status") != "completed":
         raise CritiqueError("APIの生成が完了していません。モデルや出力上限を確認してください。")
@@ -94,15 +115,46 @@ def parse_response(response: object) -> str:
     return text
 
 
+def parse_usage(response: object) -> dict[str, int] | None:
+    if not isinstance(response, dict) or not isinstance(response.get("usage"), dict):
+        return None
+    usage = response["usage"]
+    required = ("input_tokens", "output_tokens", "total_tokens")
+    if any(type(usage.get(key)) is not int or usage[key] < 0 for key in required):
+        return None
+    result = {key: usage[key] for key in required}
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict) and type(input_details.get("cached_tokens")) is int and input_details["cached_tokens"] >= 0:
+        result["cached_tokens"] = input_details["cached_tokens"]
+    output_details = usage.get("output_tokens_details")
+    if isinstance(output_details, dict) and type(output_details.get("reasoning_tokens")) is int and output_details["reasoning_tokens"] >= 0:
+        result["reasoning_tokens"] = output_details["reasoning_tokens"]
+    return result
+
+
+def format_token_usage(usage: dict[str, int] | None) -> str:
+    if usage is None:
+        return "取得不可"
+    text = f"入力 {usage['input_tokens']} / 出力 {usage['output_tokens']} / 合計 {usage['total_tokens']}"
+    details = []
+    if "cached_tokens" in usage:
+        details.append(f"キャッシュ済み入力 {usage['cached_tokens']}")
+    if "reasoning_tokens" in usage:
+        details.append(f"推論 {usage['reasoning_tokens']}")
+    return text + ("（" + "、".join(details) + "）" if details else "")
+
+
 class OpenAIReviewer:
     def __init__(self, api_key: str, model: str, max_output_tokens: int, timeout: float):
         self._api_key = api_key
         self.model = model
         self.max_output_tokens = max_output_tokens
         self.timeout = timeout
+        self.last_usage: dict[str, int] | None = None
         self._opener = build_opener(NoRedirect())
 
     def review(self, instructions: str, text: str) -> str:
+        self.last_usage = None
         body = json.dumps({
             "model": self.model,
             "instructions": instructions,
@@ -157,7 +209,9 @@ class OpenAIReviewer:
             raise CritiqueError("API通信に失敗しました。接続・証明書・タイムアウトを確認してください。") from None
         except (ValueError, UnicodeError):
             raise CritiqueError("API応答をJSONとして読み取れませんでした。") from None
-        return parse_response(data)
+        result = parse_response(data)
+        self.last_usage = parse_usage(data)
+        return result
 
 
 def evaluate(novel: str, review: Callable[[str, str], str], progress: Callable[[str], None]) -> tuple[list[str], str]:
