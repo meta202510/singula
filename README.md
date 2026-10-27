@@ -1,6 +1,6 @@
 # singula — 小説批評ツール（Excel VBA / Python）
 
-# novel_critique_gui
+## novel_critique_gui
 Windows版ExcelのVBAからOpenAI APIを呼び出し、小説の批評をテキストに出力します。Pythonや追加のVBAライブラリは不要です。Windowsデスクトップ版Excel向けで、Mac版・Web版Excelには対応していません。
 
 独立して使えるPython版もあります。Python版はExcelを必要とせず、Windows・macOS・Linuxのコマンドラインで実行できます。以下の「Python版」を参照してください。
@@ -265,9 +265,9 @@ py -m unittest discover -s tests -v
 
 モックのテストではソケット生成、通信クライアント生成を例外に差し替えて、通信経路に入ると失敗するようにしています。全6段階の完了、各段階でのエラー、停止・再開、結果の識別、既存ファイル保護、保存失敗からの再開を確認します。既存の本番経路のテストも引き続き実行します。画面の実表示・手操作はこのクラウド環境では未確認です。
 
-# award_decider_gui
-## AI文学賞 受賞作品決定ツール
 
+# AI文学賞 受賞作品決定ツール
+## award_decider_gui
 既存の批評結果ファイルを比較して、1作品を第1位として選ぶ独立GUIツールです。小説本文は読み込まず、各 `.txt` の批評結果だけを比較します。元ファイルの1行目を作品タイトルとして扱い、「審査員１」～「審査員５」と「総評」を含む形式に対応します。
 
 Windowsでは、`award_decider_gui.py`、`award_decider.py`、`novel_critique.py` を同じフォルダーに置き、`start_award_decider.bat` をダブルクリックして起動します。Python 3.10以上が必要です。追加ライブラリはなく、`requirements-award.txt` にも外部依存なしと記載しています。
