@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -144,6 +145,19 @@ def format_token_usage(usage: dict[str, int] | None) -> str:
     return text + ("（" + "、".join(details) + "）" if details else "")
 
 
+def aggregate_usage(usages: list[dict[str, int] | None]) -> dict[str, int] | None:
+    """Combine complete per-request usage; never present a partial total as complete."""
+    if not usages or any(not isinstance(usage, dict) for usage in usages):
+        return None
+    keys = ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens")
+    return {
+        key: sum(usage.get(key, 0) for usage in usages if isinstance(usage, dict))
+        for key in keys
+        if key in ("input_tokens", "output_tokens", "total_tokens")
+        or any(key in usage for usage in usages if isinstance(usage, dict))
+    }
+
+
 class OpenAIReviewer:
     def __init__(self, api_key: str, model: str, max_output_tokens: int, timeout: float):
         self._api_key = api_key
@@ -232,7 +246,15 @@ def evaluate(novel: str, review: Callable[[str, str], str], progress: Callable[[
     return reviews, overall.strip()
 
 
-def format_result(filename: str, reviews: list[str], overall: str) -> str:
+def format_result(
+    filename: str,
+    reviews: list[str],
+    overall: str,
+    *,
+    model: str | None = None,
+    token_usage: str | None = None,
+    elapsed_seconds: float | None = None,
+) -> str:
     def normalize(text: str) -> str:
         return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
@@ -240,20 +262,43 @@ def format_result(filename: str, reviews: list[str], overall: str) -> str:
         f"審査員{number}\n{normalize(text)}"
         for number, text in zip("１２３４５", reviews, strict=True)
     ]
-    return filename + "\n" + "\n\n".join(sections + ["総評\n" + normalize(overall)]) + "\n"
+    result_sections = sections + ["総評\n" + normalize(overall)]
+    if model is not None or token_usage is not None or elapsed_seconds is not None:
+        info = ["【実行情報】"]
+        if model is not None:
+            info.append(f"使用モデル：{model}")
+        if token_usage is not None:
+            info.append(f"API使用トークン数：{token_usage}")
+        if elapsed_seconds is not None:
+            info.append(f"所要時間：{elapsed_seconds:.2f}秒")
+        result_sections.append("\n".join(info))
+    return filename + "\n" + "\n\n".join(result_sections) + "\n"
 
 
 def save_result(path: Path, text: str) -> None:
-    """Publish a complete file atomically, without overwriting an existing path."""
+    """Publish a complete file without overwriting, including on OneDrive folders."""
     temporary = None
+    reserved = False
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".singula-", delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(text.replace("\n", "\r\n").encode("utf-8-sig"))
             stream.flush()
             os.fsync(stream.fileno())
-        # A hard link atomically publishes completed data and rejects existing targets.
-        os.link(temporary, path)
+        # Reserve the name exclusively, then replace only our empty reservation.
+        # This avoids hard links, which can fail in OneDrive and network folders.
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(descriptor)
+        reserved = True
+        try:
+            os.replace(temporary, path)
+            temporary = None
+            reserved = False
+        except OSError:
+            if reserved:
+                path.unlink(missing_ok=True)
+                reserved = False
+            raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -261,7 +306,7 @@ def save_result(path: Path, text: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="小説を5人が独立して批評し、その批評だけから総評を作成します。6回のAPI利用料金が発生します。",
+        description="小説を5人が独立して批評し、その批評だけから総評を作成します。5人分のAPI利用料金が発生し、総評生成にもAPIを使用します。",
     )
     parser.add_argument("input", type=Path, help="小説のテキストファイル")
     parser.add_argument("-o", "--output", type=Path, help="出力先（省略時: 入力名_批評.txt）")
@@ -313,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not novel.strip():
             raise CritiqueError("入力ファイルが空です。")
+        started_at = time.monotonic()
+        usages: list[dict[str, int] | None] = []
         if args.mock:
             print("[モック] 通信・API課金は発生しません。", file=sys.stderr)
             try:
@@ -325,9 +372,18 @@ def main(argv: list[str] | None = None) -> int:
             if not api_key:
                 raise CritiqueError("環境変数 OPENAI_API_KEY を設定してください。キーをソースに記入しないでください。")
             reviewer = OpenAIReviewer(api_key, args.model.strip(), args.max_output_tokens, args.timeout)
-            print("小説本文をOpenAI APIへ送信します（合計6回・従量課金）。", file=sys.stderr)
-            reviews, overall = evaluate(novel, reviewer.review, lambda text: print(text, file=sys.stderr))
-        save_result(output, format_result(args.input.name, reviews, overall))
+            print("小説本文をOpenAI APIへ送信します（5人分の従量課金、総評生成にもAPIを使用）。", file=sys.stderr)
+            def review_with_usage(instructions: str, text: str) -> str:
+                result = reviewer.review(instructions, text)
+                usages.append(reviewer.last_usage)
+                return result
+            reviews, overall = evaluate(novel, review_with_usage, lambda text: print(text, file=sys.stderr))
+        token_usage = "API未使用（0）" if args.mock else format_token_usage(aggregate_usage(usages))
+        result_model = "API未使用（モック）" if args.mock else args.model.strip()
+        save_result(output, format_result(
+            args.input.name, reviews, overall, model=result_model,
+            token_usage=token_usage, elapsed_seconds=time.monotonic() - started_at,
+        ))
     except UnicodeError:
         print("入力の文字コードを読み取れません。--encoding を確認してください。", file=sys.stderr)
         return 1

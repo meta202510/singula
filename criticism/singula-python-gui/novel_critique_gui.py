@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import threading
+import time
 
 from novel_critique import (
-    DEFAULT_MODEL, MODEL_FETCH_ERROR, CritiqueError, OpenAIReviewer, evaluate, fetch_models, format_result, save_result,
+    DEFAULT_MODEL, MODEL_FETCH_ERROR, CritiqueError, OpenAIReviewer, aggregate_usage, evaluate, fetch_models,
+    format_result, format_token_usage, save_result,
     threshold_result, validate_thresholds,
 )
 from mock_review import MARKER, MockOptions, MockStopped, evaluate_mock
@@ -35,10 +37,108 @@ class Settings:
     mock_fail_at: int | None = None
 
 
+@dataclass(frozen=True)
+class BatchSettings:
+    input_dir: Path
+    output_dir: Path
+    api_key: str = field(repr=False)
+    model: str = DEFAULT_MODEL
+    encoding: str = "utf-8-sig"
+    max_output_tokens: int = 4000
+    timeout: float = 180
+    min_chars: int | None = None
+    max_chars: int | None = None
+    mock: bool = False
+    mock_resume: bool = False
+    mock_stop_after: int | None = None
+    mock_fail_at: int | None = None
+
+
+def discover_inputs(folder: Path) -> list[Path]:
+    if not folder.is_dir():
+        raise CritiqueError("入力フォルダーが存在しません。")
+    return sorted(
+        (path for path in folder.iterdir() if path.is_file() and path.suffix.casefold() == ".txt"),
+        key=lambda path: (path.name.casefold(), path.name),
+    )
+
+
+def output_path_for(source: Path, output_dir: Path, mock: bool) -> Path:
+    suffix = "_MOCK_批評.txt" if mock else "_批評.txt"
+    return output_dir / (source.stem + suffix)
+
+
+def run_batch(settings: BatchSettings, events: Queue) -> None:
+    """Evaluate every top-level text file sequentially without mixing works."""
+    try:
+        if not settings.output_dir.is_dir():
+            raise CritiqueError("出力フォルダーが存在しません。")
+        if settings.input_dir.resolve() == settings.output_dir.resolve():
+            raise CritiqueError("入力フォルダーと出力フォルダーは別々に指定してください。")
+        sources = discover_inputs(settings.input_dir)
+        if not sources:
+            raise CritiqueError("入力フォルダーに .txt ファイルがありません。")
+        destinations = [output_path_for(source, settings.output_dir, settings.mock) for source in sources]
+        folded = [path.name.casefold() for path in destinations]
+        if len(folded) != len(set(folded)):
+            raise CritiqueError("出力ファイル名が重複します。入力ファイル名を確認してください。")
+        existing = [path.name for path in destinations if os.path.lexists(path)]
+        if existing and not (settings.mock and settings.mock_resume):
+            sample = "、".join(existing[:3]) + ("ほか" if len(existing) > 3 else "")
+            raise CritiqueError(f"出力先に既存の結果があります：{sample}\n別の出力フォルダーを選ぶか、既存ファイルを移動してください。")
+        events.put(("batch_setup", str(len(sources))))
+        completed = 0
+        skipped_existing = 0
+        last_result = ""
+        for index, (source, destination) in enumerate(zip(sources, destinations, strict=True), 1):
+            if settings.mock and settings.mock_resume and os.path.lexists(destination):
+                skipped_existing += 1
+                events.put(("file_done", f"[{index}/{len(sources)}] {source.name}：完了済みのモック結果を保持"))
+                continue
+            events.put(("progress", f"[{index}/{len(sources)}] {source.name} を開始します…"))
+            single = Settings(
+                source, destination, settings.api_key, settings.model, settings.encoding,
+                settings.max_output_tokens, settings.timeout, settings.min_chars, settings.max_chars,
+                settings.mock, settings.mock_resume, settings.mock_stop_after, settings.mock_fail_at,
+            )
+            local_events: Queue = Queue()
+            run_job(single, local_events)
+            terminal = None
+            while not local_events.empty():
+                kind, text = local_events.get_nowait()
+                if kind == "progress":
+                    events.put(("progress", f"[{index}/{len(sources)}] {source.name}：{text}"))
+                else:
+                    terminal = (kind, text)
+            if terminal is None:
+                raise CritiqueError(f"{source.name}：処理結果を取得できませんでした。")
+            kind, text = terminal
+            if kind == "paused":
+                events.put(("paused", f"{source.name}：{text}"))
+                return
+            if kind == "error":
+                events.put(("error", f"{source.name}：{text}"))
+                return
+            completed += 1
+            last_result = text
+            label = "評価無し" if kind == "skipped" else "保存完了"
+            events.put(("file_done", f"[{index}/{len(sources)}] {source.name}：{label}"))
+        summary = f"{len(sources)}件中{completed + skipped_existing}件を完了しました。出力先: {settings.output_dir}"
+        if skipped_existing:
+            summary += f"\n（完了済みのモック結果 {skipped_existing}件を保持）"
+        events.put(("batch_done", summary + ("\n\n最後の結果:\n" + last_result if last_result else "")))
+    except (CritiqueError, OSError) as exc:
+        events.put(("error", str(exc)))
+    except Exception:
+        events.put(("error", "予期しないエラーが発生しました。設定と入力フォルダーを確認してください。"))
+
+
 def run_job(settings: Settings, events: Queue) -> None:
     """Worker: no Tk calls; all user-visible changes travel through a queue."""
     try:
         mock_options = MockOptions(settings.mock_resume, settings.mock_stop_after, settings.mock_fail_at)
+        started_at = time.monotonic()
+        usages: list[dict[str, int] | None] = []
         if settings.mock:
             mock_options.validate()
         elif settings.mock_resume or settings.mock_stop_after is not None or settings.mock_fail_at is not None:
@@ -73,8 +173,17 @@ def run_job(settings: Settings, events: Queue) -> None:
             reviewer = OpenAIReviewer(
                 settings.api_key.strip(), settings.model.strip(), settings.max_output_tokens, settings.timeout,
             )
-            reviews, overall = evaluate(novel, reviewer.review, lambda text: events.put(("progress", text)))
-        result = format_result(settings.input_path.name, reviews, overall)
+            def review_with_usage(instructions: str, text: str) -> str:
+                result = reviewer.review(instructions, text)
+                usages.append(reviewer.last_usage)
+                return result
+            reviews, overall = evaluate(novel, review_with_usage, lambda text: events.put(("progress", text)))
+        token_usage = "API未使用（0）" if settings.mock else format_token_usage(aggregate_usage(usages))
+        result_model = "API未使用（モック）" if settings.mock else settings.model.strip()
+        result = format_result(
+            settings.input_path.name, reviews, overall, model=result_model,
+            token_usage=token_usage, elapsed_seconds=time.monotonic() - started_at,
+        )
         save_result(settings.output_path, result)
         events.put(("done", result))
     except MockStopped as exc:
@@ -102,6 +211,7 @@ def main() -> None:
             self.events = Queue()
             self.controls = []
             self.completed = 0
+            self.completed_files = 0
             root.title("小説批評 — 5人の審査員と総評")
             height = min(780, max(360, root.winfo_screenheight() - 140))
             root.geometry(f"900x{height}")
@@ -140,10 +250,10 @@ def main() -> None:
             self.mock_resume = tk.BooleanVar(value=False)
             self.mock_stop = tk.StringVar()
             self.mock_fail = tk.StringVar()
-            self.mode_notice = tk.StringVar(value="本番：範囲内の本文をOpenAIに送信します。6回分のAPI料金が発生します。")
-            self.status = tk.StringVar(value="入力ファイルと保存先を選択してください。")
-            self.entry(frame, 2, "小説ファイル", self.input_path, self.select_input)
-            self.entry(frame, 3, "結果の保存先", self.output_path, self.select_output)
+            self.mode_notice = tk.StringVar(value="本番：範囲内の本文をOpenAIに送信します。5人分のAPI料金が発生し、総評生成にもAPIを使用します。")
+            self.status = tk.StringVar(value="入力フォルダーと出力フォルダーを選択してください。")
+            self.entry(frame, 2, "入力フォルダー", self.input_path, self.select_input)
+            self.entry(frame, 3, "出力フォルダー", self.output_path, self.select_output)
             self.api_key_entry = self.entry(frame, 4, "APIキー", self.api_key, password=True)
             self.api_key_entry.bind("<Return>", lambda _: self.refresh_models())
             self.api_key_entry.bind("<FocusOut>", lambda _: self.refresh_models())
@@ -250,27 +360,24 @@ def main() -> None:
             return widget
 
         def select_input(self):
-            path = filedialog.askopenfilename(parent=self.root, title="小説を選択", filetypes=[("テキスト", "*.txt"), ("すべて", "*")])
+            path = filedialog.askdirectory(parent=self.root, title="小説テキストの入力フォルダーを選択")
             if path:
                 self.input_path.set(path)
-                source = Path(path)
-                self.output_path.set(str(source.with_name(source.stem + ("_MOCK_批評.txt" if self.mock.get() else "_批評.txt"))))
+                try:
+                    count = len(discover_inputs(Path(path)))
+                    self.status.set(f"{count}件の .txt ファイルを読み込みます。")
+                except CritiqueError as exc:
+                    self.status.set(str(exc))
 
         def toggle_mock(self):
-            self.mode_notice.set("モック：通信・課金なし。出力はテスト専用です。" if self.mock.get() else "本番：範囲内の本文をOpenAIに送信します。6回分のAPI料金が発生します。")
+            self.mode_notice.set("モック：通信・課金なし。出力はテスト専用です。" if self.mock.get() else "本番：範囲内の本文をOpenAIに送信します。5人分のAPI料金が発生し、総評生成にもAPIを使用します。")
             if not self.mock.get():
                 self.mock_resume.set(False)
                 self.mock_stop.set("")
                 self.mock_fail.set("")
-            if self.input_path.get():
-                source = Path(self.input_path.get())
-                old = source.with_name(source.stem + ("_批評.txt" if self.mock.get() else "_MOCK_批評.txt"))
-                if self.output_path.get() == str(old):
-                    self.output_path.set(str(source.with_name(source.stem + ("_MOCK_批評.txt" if self.mock.get() else "_批評.txt"))))
 
         def select_output(self):
-            current = Path(self.output_path.get()) if self.output_path.get() else None
-            path = filedialog.asksaveasfilename(parent=self.root, title="結果の保存先", defaultextension=".txt", initialfile=current.name if current else "批評.txt", initialdir=str(current.parent) if current else None, filetypes=[("テキスト", "*.txt")])
+            path = filedialog.askdirectory(parent=self.root, title="批評結果の出力フォルダーを選択")
             if path:
                 self.output_path.set(path)
 
@@ -279,7 +386,7 @@ def main() -> None:
                 return
             try:
                 if not self.input_path.get().strip() or not self.output_path.get().strip():
-                    raise ValueError("入力ファイルと保存先を指定してください。")
+                    raise ValueError("入力フォルダーと出力フォルダーを指定してください。")
                 try:
                     tokens = int(self.tokens.get())
                     timeout = int(self.timeout.get())
@@ -294,19 +401,20 @@ def main() -> None:
                 if not self.mock.get() and (not selected_model or selected_model == MODEL_FETCH_ERROR):
                     raise CritiqueError(MODEL_FETCH_ERROR)
                 model_for_run = selected_model if selected_model and selected_model != MODEL_FETCH_ERROR else "API未使用"
-                settings = Settings(Path(self.input_path.get()), Path(self.output_path.get()), self.api_key.get(), model_for_run, self.encoding.get(), tokens, timeout, min_chars, max_chars)
+                settings = BatchSettings(Path(self.input_path.get()), Path(self.output_path.get()), self.api_key.get(), model_for_run, self.encoding.get(), tokens, timeout, min_chars, max_chars)
                 settings = replace(settings, mock=self.mock.get(), mock_resume=self.mock_resume.get(), mock_stop_after=int(self.mock_stop.get()) if self.mock_stop.get() else None, mock_fail_at=int(self.mock_fail.get()) if self.mock_fail.get() else None)
             except (ValueError, CritiqueError) as exc:
                 messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
                 return
             self.running = True
             self.completed = 0
+            self.completed_files = 0
             self.progress["value"] = 0
             self.set_preview("")
-            self.status.set("入力ファイルと設定を確認中です…")
+            self.status.set("入力フォルダーと設定を確認中です…")
             for widget, _ in self.controls:
                 widget.configure(state="disabled")
-            threading.Thread(target=run_job, args=(settings, self.events), daemon=True).start()
+            threading.Thread(target=run_batch, args=(settings, self.events), daemon=True).start()
 
         def set_preview(self, text):
             self.preview.configure(state="normal")
@@ -328,9 +436,17 @@ def main() -> None:
                         self.fetching_models = False
                         self.model_button.configure(state="normal")
                         self.apply_model_error()
+                    elif kind == "batch_setup":
+                        total = int(text)
+                        self.progress.configure(maximum=max(1, total * 7))
+                        self.status.set(f"{total}件の評価を開始します。")
                     elif kind == "progress":
                         self.progress["value"] = self.completed
                         self.completed += 1
+                        self.status.set(text)
+                    elif kind == "file_done":
+                        self.completed_files += 1
+                        self.progress["value"] = self.completed_files * 7
                         self.status.set(text)
                     else:
                         self.running = False
@@ -339,10 +455,10 @@ def main() -> None:
                         if kind == "paused":
                             self.status.set(text)
                             self.progress["value"] = int(self.mock_stop.get()) if self.mock_stop.get() else 0
-                        elif kind in ("done", "skipped"):
-                            self.progress["value"] = 6 if kind == "done" else 0
+                        elif kind == "batch_done":
+                            self.progress["value"] = self.progress["maximum"]
                             self.set_preview(text)
-                            self.status.set(("[モック] " if self.mock.get() else "") + ("評価無し・API送信なし。保存しました: " if kind == "skipped" else "保存しました: ") + self.output_path.get())
+                            self.status.set(("[モック] " if self.mock.get() else "") + text.split("\n", 1)[0])
                         else:
                             self.status.set("処理を完了できませんでした。")
                             messagebox.showerror("評価エラー", text + ("\nモックのため通信・課金はありません。" if self.mock.get() else "\n送信済みの処理には料金が発生する場合があります。"), parent=self.root)
